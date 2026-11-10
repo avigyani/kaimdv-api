@@ -1,7 +1,10 @@
-// KAIMDV API - Gemini proxy v2. Key lives ONLY in Vercel env (GEMINI_KEY).
+// KAIMDV API - Gemini proxy v3. Key lives ONLY in Vercel env (GEMINI_KEY).
 // v2 changes: per-model timeout (a hung model no longer stalls everything),
 // slow 3.8 model dropped, and a new kind:'voice' — Gemini AI voice (TTS model)
 // returning WAV audio for the English Kali app.
+// v3 changes: voice tries the newer TTS models first (3.1 / 3.8 series,
+// Kannada supported, language auto-detected) — the 2.5 TTS previews shut
+// down on 2026-11-17, so they are only a last resort now.
 const KEY = process.env.GEMINI_KEY;
 const ORIGIN = 'https://avigyani.github.io';
 
@@ -11,6 +14,17 @@ async function callGemini(model, body) {
     headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': KEY },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(20000)
+  });
+  const j = await r.json().catch(() => null);
+  return { status: r.status, json: j };
+}
+
+async function callGeminiVoice(model, body) {
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': KEY },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000)
   });
   const j = await r.json().catch(() => null);
   return { status: r.status, json: j };
@@ -77,19 +91,25 @@ module.exports = async (req, res) => {
           )
         }
       });
+      // 2.5 TTS previews shut down 2026-11-17; 3.x models auto-detect the
+      // language (Kannada included), so try them first, without languageCode.
+      const VMODELS = ['gemini-3.1-flash-tts-preview', 'gemini-3.8-flash-lite-tts', 'gemini-3.8-flash-tts', 'gemini-2.5-flash-preview-tts'];
+      const attempts = VMODELS.map(m => ({ m, withLang: false }));
+      if (langCode) { attempts.push({ m: VMODELS[0], withLang: true }); attempts.push({ m: VMODELS[1], withLang: true }); }
       let lastErr = '';
-      for (const withLang of [true, false]) {
-        const out = await callGemini('gemini-2.5-flash-preview-tts', mkBody(withLang));
+      for (const a of attempts) {
+        let out;
+        try { out = await callGeminiVoice(a.m, mkBody(a.withLang)); } catch (e) { lastErr = String((e && e.message) || e); continue; }
         const parts = partsOf(out.json);
         const au = parts.find(p => p.inlineData && (p.inlineData.mimeType || '').indexOf('audio') === 0);
         if (au) {
           const pcm = Buffer.from(au.inlineData.data, 'base64');
           const mRate = /rate=(\d+)/.exec(au.inlineData.mimeType || '');
           const wav = wavWrap(pcm, mRate ? +mRate[1] : 24000);
-          return res.status(200).json({ audio: 'data:audio/wav;base64,' + wav.toString('base64'), model: 'gemini-2.5-flash-preview-tts' });
+          return res.status(200).json({ audio: 'data:audio/wav;base64,' + wav.toString('base64'), model: a.m });
         }
         lastErr = (out.json && out.json.error && out.json.error.message) || ('HTTP ' + out.status);
-        if (!langCode) break;
+        console.log('voice attempt failed:', a.m, a.withLang ? 'with-lang' : 'auto', lastErr);
       }
       return res.status(502).json({ error: lastErr || 'voice failed' });
     }
